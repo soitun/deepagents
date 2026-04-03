@@ -1,5 +1,6 @@
 """Middleware for providing subagents to an agent via a `task` tool."""
 
+import json
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, NotRequired, TypedDict, Unpack, cast
@@ -7,6 +8,7 @@ from typing import Any, NotRequired, TypedDict, Unpack, cast
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware, InterruptOnConfig
 from langchain.agents.middleware.types import AgentMiddleware, ContextT, ModelRequest, ModelResponse, ResponseT
+from langchain.agents.structured_output import ResponseFormat
 from langchain.tools import BaseTool, ToolRuntime
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, ToolMessage
@@ -76,6 +78,34 @@ class SubAgent(TypedDict):
 
     skills: NotRequired[list[str]]
     """Skill source paths for SkillsMiddleware."""
+
+    response_format: NotRequired[ResponseFormat[Any] | type | dict[str, Any]]
+    """Structured output response format for the subagent.
+
+    When specified, the subagent will produce a `structured_response` conforming to the
+    given schema. The structured response is JSON-serialized and returned as the
+    ToolMessage content to the parent agent, replacing the default last-message extraction.
+
+    Accepts any format supported by `create_agent`.
+
+    Example:
+        ```python
+        from pydantic import BaseModel
+
+        class Findings(BaseModel):
+            findings: str
+            confidence: float
+
+        analyzer: SubAgent = {
+            "name": "analyzer",
+            "description": "Analyzes data and returns structured findings",
+            "system_prompt": "Analyze the data and return your findings.",
+            "model": "openai:gpt-4o",
+            "tools": [],
+            "response_format": Findings,
+        }
+        ```
+    """
 
 
 class CompiledSubAgent(TypedDict):
@@ -367,6 +397,10 @@ def _get_subagents_legacy(
         if interrupt_on:
             _middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
 
+        create_agent_kwargs: dict[str, Any] = {}
+        if "response_format" in agent_:
+            create_agent_kwargs["response_format"] = agent_["response_format"]
+
         specs.append(
             {
                 "name": agent_["name"],
@@ -377,6 +411,7 @@ def _get_subagents_legacy(
                     tools=_tools,
                     middleware=_middleware,
                     name=agent_["name"],
+                    **create_agent_kwargs,
                 ),
             }
         )
@@ -423,12 +458,18 @@ def _build_task_tool(  # noqa: C901
             raise ValueError(error_msg)
 
         state_update = {k: v for k, v in result.items() if k not in _EXCLUDED_STATE_KEYS}
-        # Strip trailing whitespace to prevent API errors with Anthropic
-        message_text = result["messages"][-1].text.rstrip() if result["messages"][-1].text else ""
+
+        structured = result.get("structured_response")
+        if structured is not None:
+            content: str = structured.model_dump_json() if hasattr(structured, "model_dump_json") else json.dumps(structured)
+        else:
+            # Strip trailing whitespace to prevent API errors with Anthropic
+            content = result["messages"][-1].text.rstrip() if result["messages"][-1].text else ""
+
         return Command(
             update={
                 **state_update,
-                "messages": [ToolMessage(message_text, tool_call_id=tool_call_id)],
+                "messages": [ToolMessage(content, tool_call_id=tool_call_id)],
             }
         )
 
@@ -662,6 +703,10 @@ class SubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
             if interrupt_on:
                 middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
 
+            create_agent_kwargs: dict[str, Any] = {}
+            if "response_format" in spec:
+                create_agent_kwargs["response_format"] = spec["response_format"]
+
             specs.append(
                 {
                     "name": spec["name"],
@@ -672,6 +717,7 @@ class SubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
                         tools=spec["tools"],
                         middleware=middleware,
                         name=spec["name"],
+                        **create_agent_kwargs,
                     ),
                 }
             )
